@@ -1,0 +1,140 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app
+  namespace: sandboxed
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: untrusted-app
+      role: app
+  template:
+    metadata:
+      labels:
+        app: untrusted-app
+        role: app
+    spec:
+      # DNS via proxy's dnsmasq
+      dnsPolicy: "None"
+      dnsConfig:
+        nameservers:
+          - "PROXY_SVC_IP_PLACEHOLDER"
+        searches:
+          - sandboxed.svc.cluster.local
+          - svc.cluster.local
+          - cluster.local
+
+      initContainers:
+        # ── Step 1: Extract CA cert from proxy ──
+        # Copies the mitmproxy CA cert so the app trusts
+        # intercepted TLS connections. This is container-level
+        # network config, not app modification.
+        - name: fetch-ca-cert
+          image: alpine:3.19
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache curl
+              PROXY_IP="PROXY_SVC_IP_PLACEHOLDER"
+
+              echo "Waiting for proxy CA cert..."
+              for i in $(seq 1 60); do
+                # mitmproxy serves its CA cert at this magic URL
+                if curl -s --max-time 3 "http://${PROXY_IP}:8080/cert/pem" -o /shared/ca.crt 2>/dev/null; then
+                  if [ -s /shared/ca.crt ]; then
+                    echo "✅ CA cert fetched from proxy"
+                    cat /shared/ca.crt | head -2
+                    exit 0
+                  fi
+                fi
+                echo "  Attempt $i — proxy not ready yet..."
+                sleep 2
+              done
+              echo "⚠️  Could not fetch CA cert — TLS interception may fail"
+              echo "    SNI-based blocking will still work."
+              exit 0
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+
+        # ── Step 2: Set up iptables transparent redirect ──
+        # All outbound HTTP/HTTPS silently redirected to proxy.
+        - name: iptables-init
+          image: alpine:3.19
+          securityContext:
+            capabilities:
+              add: ["NET_ADMIN"]
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              apk add --no-cache iptables
+
+              PROXY_IP="PROXY_SVC_IP_PLACEHOLDER"
+
+              echo "Setting up transparent redirect → $PROXY_IP"
+
+              # Redirect HTTP → proxy transparent port
+              iptables -t nat -A OUTPUT -p tcp --dport 80 \
+                -j DNAT --to-destination ${PROXY_IP}:8080
+
+              # Redirect HTTPS → proxy transparent port
+              iptables -t nat -A OUTPUT -p tcp --dport 443 \
+                -j DNAT --to-destination ${PROXY_IP}:8443
+
+              # Common extra ports
+              for port in 8080 8443 3000 5000 8000 8888 9090; do
+                iptables -t nat -A OUTPUT -p tcp --dport $port \
+                  -j DNAT --to-destination ${PROXY_IP}:8080
+              done
+
+              # Block all other outbound (non-HTTP, non-DNS)
+              iptables -A OUTPUT -p tcp -d ${PROXY_IP} -j ACCEPT
+              iptables -A OUTPUT -p udp -d ${PROXY_IP} -j ACCEPT
+              iptables -A OUTPUT -p tcp --dport 53 -j ACCEPT
+              iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+              iptables -A OUTPUT -o lo -j ACCEPT
+              iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+              iptables -A OUTPUT -p tcp -j DROP
+              iptables -A OUTPUT -p udp -j DROP
+
+              echo "✅ iptables configured"
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+
+      # ── App container: completely normal ──
+      containers:
+        - name: app
+          image: alpine:3.19
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              # Install CA cert into system trust store (container config, not app config)
+              if [ -f /shared/ca.crt ]; then
+                cp /shared/ca.crt /usr/local/share/ca-certificates/mitmproxy.crt
+                update-ca-certificates 2>/dev/null
+                echo "✅ CA cert installed"
+              fi
+              exec sleep infinity
+          # NO HTTP_PROXY, NO HTTPS_PROXY, NO special config
+          # Cannot modify iptables — NET_ADMIN dropped
+          securityContext:
+            capabilities:
+              drop: ["NET_ADMIN", "NET_RAW"]
+          volumeMounts:
+            - name: shared
+              mountPath: /shared
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+
+      volumes:
+        - name: shared
+          emptyDir: {}

@@ -1,0 +1,125 @@
+version: "3.8"
+
+# =============================================================================
+# Container Firewall PoC — Fully Transparent
+# =============================================================================
+# The app container has NO knowledge of the proxy. No HTTP_PROXY env vars.
+# No modified requests. The app makes normal requests (domains or IPs).
+#
+# Architecture:
+#   - internal_net: isolated, NO internet (internal: true)
+#   - external_net: has internet
+#   - proxy: dual-homed, transparent intercept via iptables
+#   - app: internal_net ONLY, uses proxy as its default gateway
+# =============================================================================
+
+networks:
+  internal_net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          gateway: 172.30.0.10    # proxy IS the gateway
+
+  external_net:
+    driver: bridge
+
+services:
+  # ─────────────────────────────────────────────
+  # PROXY — transparent intercepting gateway
+  # ─────────────────────────────────────────────
+  proxy:
+    build:
+      context: ./proxy
+      dockerfile: Dockerfile
+    container_name: proxy
+    cap_add:
+      - NET_ADMIN                 # required for iptables
+      - NET_RAW
+    sysctls:
+      - net.ipv4.ip_forward=1     # enable routing
+    networks:
+      internal_net:
+        ipv4_address: 172.30.0.10
+      external_net: {}
+    ports:
+      - "8081:8081"               # mitmproxy web UI
+    volumes:
+      - ./proxy/scripts:/home/mitmproxy/scripts:ro
+      - proxy-certs:/home/mitmproxy/.mitmproxy   # generated CA cert
+      - shared-certs:/shared-certs                # shared with app
+    restart: unless-stopped
+
+  # ─────────────────────────────────────────────
+  # CERT-INIT — copies the CA cert to shared volume
+  # ─────────────────────────────────────────────
+  # Runs once after proxy starts, copies the mitmproxy CA cert
+  # to the shared volume so the app container can trust it.
+  # This is network config, not app modification — the app
+  # code doesn't change; only the container's trust store does.
+  # ─────────────────────────────────────────────
+  cert-init:
+    image: alpine:3.19
+    container_name: cert-init
+    depends_on:
+      - proxy
+    volumes:
+      - proxy-certs:/certs:ro
+      - shared-certs:/shared-certs
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        echo "Waiting for mitmproxy to generate CA cert..."
+        for i in $$(seq 1 30); do
+          if [ -f /certs/mitmproxy-ca-cert.pem ]; then
+            cp /certs/mitmproxy-ca-cert.pem /shared-certs/ca.crt
+            echo "✅ CA cert copied to shared volume"
+            exit 0
+          fi
+          sleep 1
+        done
+        echo "❌ Timed out waiting for CA cert"
+        exit 1
+    networks:
+      internal_net: {}
+
+  # ─────────────────────────────────────────────
+  # APP — untrusted, completely unaware of proxy
+  # ─────────────────────────────────────────────
+  app:
+    image: alpine:3.19
+    container_name: app
+    networks:
+      internal_net:
+        ipv4_address: 172.30.0.20
+    # NO external_net — cannot reach internet directly
+    # NO HTTP_PROXY — app is completely unaware
+    dns:
+      - 172.30.0.10
+    depends_on:
+      cert-init:
+        condition: service_completed_successfully
+    volumes:
+      - shared-certs:/shared-certs:ro
+    # Install the CA cert into the system trust store on startup.
+    # This is container-level network config, NOT app code change.
+    # The app itself doesn't know or care about the cert.
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        if [ -f /shared-certs/ca.crt ]; then
+          cp /shared-certs/ca.crt /usr/local/share/ca-certificates/mitmproxy.crt
+          update-ca-certificates 2>/dev/null
+          echo "✅ CA cert installed in system trust store"
+        fi
+        exec /bin/sh
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+volumes:
+  proxy-certs:
+  shared-certs:

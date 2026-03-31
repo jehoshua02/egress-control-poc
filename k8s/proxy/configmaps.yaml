@@ -1,0 +1,157 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: proxy-scripts
+  namespace: sandboxed
+data:
+  enforcer.py: |
+    """
+    Transparent Enforcer v2 (Kubernetes)
+    BLOCK ALL, allow explicit. Three layers: SNI, domain/IP, path.
+    """
+    import mitmproxy.http
+    from mitmproxy import ctx, tls
+    import json, re
+    from datetime import datetime
+
+    TLS_INTERCEPT = True
+
+    ALLOWED_RULES = [
+        {"type": "domain", "value": "httpbin.org"},
+        {"type": "domain", "value": "example.com"},
+        {"type": "domain", "value": "dl-cdn.alpinelinux.org"},
+        {
+            "type": "domain",
+            "value": "api.github.com",
+            "paths": ["/repos/", "/users/", "/orgs/"],
+            "paths_blocked": ["/admin", "/settings"],
+        },
+    ]
+
+    def _ip_in_cidr(ip_str, cidr_str):
+        try:
+            net, bits = cidr_str.split("/")
+            bits = int(bits)
+            def to_int(ip):
+                p = ip.split(".")
+                return (int(p[0])<<24)+(int(p[1])<<16)+(int(p[2])<<8)+int(p[3])
+            mask = (0xFFFFFFFF << (32-bits)) & 0xFFFFFFFF
+            return (to_int(ip_str) & mask) == (to_int(net) & mask)
+        except:
+            return False
+
+    def _match_domain(host, rule):
+        t, v = rule["type"], rule["value"]
+        if t == "domain": return host == v or host.endswith("."+v)
+        if t == "suffix": return host.endswith(v)
+        return False
+
+    def _match_ip(ip, rule):
+        if not ip or ip == "unresolved": return False
+        t, v = rule["type"], rule["value"]
+        if t == "ip": return ip == v
+        if t == "ip_prefix": return ip.startswith(v)
+        if t == "cidr": return _ip_in_cidr(ip, v)
+        return False
+
+    def _match_host_or_ip(host, ip, rule):
+        t = rule["type"]
+        if t in ("domain","suffix"): return _match_domain(host, rule)
+        if t in ("ip","ip_prefix","cidr"): return _match_ip(ip, rule)
+        return False
+
+    def _check_path(path, rule):
+        if "paths" not in rule and "paths_blocked" not in rule:
+            return True, "all paths"
+        for pat in rule.get("paths_blocked", []):
+            if pat.startswith("regex:"):
+                if re.search(pat[6:], path): return False, f"path blocked ({pat[6:]})"
+            elif path == pat or path.startswith(pat):
+                return False, f"path blocked ({pat})"
+        if "paths" in rule:
+            for pat in rule["paths"]:
+                if pat.startswith("regex:"):
+                    if re.search(pat[6:], path): return True, f"path match ({pat[6:]})"
+                elif path == pat or path.startswith(pat):
+                    return True, f"path match ({pat})"
+            return False, "path not in allowlist"
+        return True, "path not blocked"
+
+    def _check_allowed(host, ip, port, path=None):
+        for rule in ALLOWED_RULES:
+            if "ports" in rule and port not in rule["ports"]: continue
+            if not _match_host_or_ip(host, ip, rule): continue
+            if path is not None and ("paths" in rule or "paths_blocked" in rule):
+                ok, reason = _check_path(path, rule)
+                rn = f"{rule['type']}:{rule['value']} ({reason})"
+                return ok, rn
+            return True, f"{rule['type']}:{rule['value']}"
+        return False, "no matching rule"
+
+    def _check_sni(sni):
+        for rule in ALLOWED_RULES:
+            if rule["type"] in ("domain","suffix") and _match_domain(sni, rule):
+                return True, f"{rule['type']}:{rule['value']}"
+        return False, "no matching domain rule"
+
+    class TransparentEnforcer:
+        def __init__(self):
+            pr = sum(1 for r in ALLOWED_RULES if "paths" in r or "paths_blocked" in r)
+            ctx.log.info(f"Enforcer v2: BLOCK ALL, {len(ALLOWED_RULES)} rules ({pr} with paths), TLS={'ON' if TLS_INTERCEPT else 'OFF'}")
+
+        def tls_clienthello(self, data: tls.ClientHelloData):
+            sni = data.context.client.sni
+            ts = datetime.now().strftime("%H:%M:%S")
+            if not sni:
+                ctx.log.info(f"⚠️  [{ts}] TLS no SNI — deferring")
+                return
+            ok, reason = _check_sni(sni)
+            if not ok:
+                ctx.log.warn(f"🚫 [{ts}] TLS/SNI BLOCK {sni} ({reason})")
+                data.ignore_connection = False
+                data.establish_server_tls = False
+                data.context.client.error = f"Blocked: {sni}"
+                return
+            ctx.log.info(f"🔒 [{ts}] TLS/SNI pass  {sni} ({reason})")
+            if not TLS_INTERCEPT:
+                data.ignore_connection = True
+
+        def request(self, flow):
+            h = flow.request.pretty_host
+            p = flow.request.port
+            m = flow.request.method
+            path = flow.request.path
+            sc = flow.request.scheme
+            ts = datetime.now().strftime("%H:%M:%S")
+            ip = flow.server_conn.ip_address[0] if flow.server_conn and flow.server_conn.ip_address else "unresolved"
+            ok, reason = _check_allowed(h, ip, p, path)
+            if ok:
+                ctx.log.info(f"✅ [{ts}] ALLOW {sc.upper()} {m} {h}:{p}{path} ({reason})")
+            else:
+                ctx.log.warn(f"🚫 [{ts}] BLOCK {sc.upper()} {m} {h}:{p}{path} ({reason})")
+                flow.response = mitmproxy.http.Response.make(403,
+                    json.dumps({"error":"blocked","host":h,"ip":ip,"path":path,"reason":reason}),
+                    {"Content-Type":"application/json"})
+
+        def response(self, flow):
+            if flow.response:
+                ctx.log.info(f"   ↳ {flow.response.status_code} from {flow.request.pretty_host}")
+
+    addons = [TransparentEnforcer()]
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: proxy-dnsmasq
+  namespace: sandboxed
+data:
+  dnsmasq.conf: |
+    listen-address=0.0.0.0
+    bind-interfaces
+    server=8.8.8.8
+    server=8.8.4.4
+    log-queries
+    log-facility=-
+    no-resolv
+    cache-size=1000

@@ -1,0 +1,144 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxy
+  namespace: sandboxed
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: proxy
+      role: proxy
+  template:
+    metadata:
+      labels:
+        app: proxy
+        role: proxy
+    spec:
+      containers:
+        - name: mitmproxy
+          image: mitmproxy/mitmproxy:10.4.2
+          command: ["mitmweb"]
+          args:
+            - "--mode"
+            - "transparent@8080"
+            - "--mode"
+            - "transparent@8443"
+            - "--web-host"
+            - "0.0.0.0"
+            - "--web-port"
+            - "8081"
+            - "--set"
+            - "ssl_insecure=true"
+            - "--set"
+            - "block_global=false"
+            - "--set"
+            - "connection_strategy=lazy"
+            - "-s"
+            - "/home/mitmproxy/scripts/enforcer.py"
+          ports:
+            - containerPort: 8080
+              name: http-transparent
+            - containerPort: 8443
+              name: https-transparent
+            - containerPort: 8081
+              name: web-ui
+          volumeMounts:
+            - name: scripts
+              mountPath: /home/mitmproxy/scripts
+              readOnly: true
+            - name: certs
+              mountPath: /home/mitmproxy/.mitmproxy
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+
+        - name: dnsmasq
+          image: alpine:3.19
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              apk add --no-cache dnsmasq &&
+              cp /etc/dnsmasq-custom/dnsmasq.conf /etc/dnsmasq.conf &&
+              dnsmasq --keep-in-foreground
+          ports:
+            - containerPort: 53
+              name: dns-udp
+              protocol: UDP
+            - containerPort: 53
+              name: dns-tcp
+              protocol: TCP
+          volumeMounts:
+            - name: dnsmasq-config
+              mountPath: /etc/dnsmasq-custom
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+
+      volumes:
+        - name: scripts
+          configMap:
+            name: proxy-scripts
+        - name: dnsmasq-config
+          configMap:
+            name: proxy-dnsmasq
+        - name: certs
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxy-svc
+  namespace: sandboxed
+spec:
+  selector:
+    app: proxy
+    role: proxy
+  ports:
+    - name: http-transparent
+      port: 8080
+      targetPort: 8080
+    - name: https-transparent
+      port: 8443
+      targetPort: 8443
+    - name: dns-udp
+      port: 53
+      targetPort: 53
+      protocol: UDP
+    - name: dns-tcp
+      port: 53
+      targetPort: 53
+      protocol: TCP
+  type: ClusterIP
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: proxy-webui
+  namespace: sandboxed
+spec:
+  selector:
+    app: proxy
+    role: proxy
+  ports:
+    - name: web-ui
+      port: 8081
+      targetPort: 8081
+      nodePort: 30081
+  type: NodePort
