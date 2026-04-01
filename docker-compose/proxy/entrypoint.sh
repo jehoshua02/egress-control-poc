@@ -26,7 +26,7 @@ echo ""
 #    but ensure it's on)
 # ─────────────────────────────────────────────
 echo "[+] Enabling IP forwarding..."
-echo 1 > /proc/sys/net/ipv4/ip_forward
+echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true  # already set via sysctl in compose
 
 # ─────────────────────────────────────────────
 # 3. Flush existing rules
@@ -106,7 +106,7 @@ echo ""
 # 7. Start DNS forwarder
 # ─────────────────────────────────────────────
 echo "[+] Starting dnsmasq..."
-dnsmasq
+dnsmasq --conf-file=/etc/dnsmasq.d/proxy.conf
 
 # ─────────────────────────────────────────────
 # 8. Start mitmproxy in transparent-only mode

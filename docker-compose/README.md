@@ -81,8 +81,7 @@ docker compose logs -f proxy
 # Open Web UI
 open http://localhost:8081
 
-# Run tests
-docker cp scripts/test.sh app:/test.sh
+# Run tests (bundled in the app image)
 docker exec -it app /bin/sh /test.sh
 
 # Interactive shell
@@ -169,7 +168,8 @@ container-firewall/
 │   ├── dnsmasq.conf                # DNS forwarder
 │   └── scripts/
 │       └── enforcer.py             # v2: SNI + domain/IP + path rules
-├── scripts/
+├── app/
+│   ├── Dockerfile                  # alpine + curl + ca-certificates + test.sh
 │   └── test.sh                     # Full test suite (HTTP + HTTPS)
 └── README.md
 ```
@@ -197,10 +197,10 @@ CA cert distribution automatically:
       - -c
       - |
         # Install CA cert (adjust for your base image's cert system)
-        # Alpine:
+        # Alpine (ca-certificates pkg installed):
         cp /shared-certs/ca.crt /usr/local/share/ca-certificates/mitmproxy.crt
         update-ca-certificates 2>/dev/null
-        # Debian/Ubuntu: same path, same command
+        # Debian/Ubuntu: same as Alpine above
         # RHEL/Fedora: cp to /etc/pki/ca-trust/source/anchors/ && update-ca-trust
 
         exec your-actual-entrypoint

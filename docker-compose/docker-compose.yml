@@ -20,7 +20,7 @@ networks:
     ipam:
       config:
         - subnet: 172.30.0.0/24
-          gateway: 172.30.0.10    # proxy IS the gateway
+          gateway: 172.30.0.1
 
   external_net:
     driver: bridge
@@ -47,7 +47,7 @@ services:
       - "8081:8081"               # mitmproxy web UI
     volumes:
       - ./proxy/scripts:/home/mitmproxy/scripts:ro
-      - proxy-certs:/home/mitmproxy/.mitmproxy   # generated CA cert
+      - proxy-certs:/root/.mitmproxy               # generated CA cert (runs as root)
       - shared-certs:/shared-certs                # shared with app
     restart: unless-stopped
 
@@ -89,8 +89,12 @@ services:
   # APP — untrusted, completely unaware of proxy
   # ─────────────────────────────────────────────
   app:
-    image: alpine:3.19
+    build:
+      context: ./app
+      dockerfile: Dockerfile
     container_name: app
+    cap_add:
+      - NET_ADMIN                 # required to set default route via proxy
     networks:
       internal_net:
         ipv4_address: 172.30.0.20
@@ -103,13 +107,14 @@ services:
         condition: service_completed_successfully
     volumes:
       - shared-certs:/shared-certs:ro
-    # Install the CA cert into the system trust store on startup.
-    # This is container-level network config, NOT app code change.
-    # The app itself doesn't know or care about the cert.
+    # Container-level network config — NOT app code changes.
+    # The app itself doesn't know or care about any of this.
     entrypoint: /bin/sh
     command:
       - -c
       - |
+        ip route replace default via 172.30.0.10 dev eth0
+        echo "✅ Default route set via proxy (172.30.0.10)"
         if [ -f /shared-certs/ca.crt ]; then
           cp /shared-certs/ca.crt /usr/local/share/ca-certificates/mitmproxy.crt
           update-ca-certificates 2>/dev/null
