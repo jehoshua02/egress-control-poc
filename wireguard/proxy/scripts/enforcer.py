@@ -23,6 +23,9 @@ import mitmproxy.http
 from mitmproxy import ctx, tls
 import json
 import re
+import socket
+import posixpath
+from urllib.parse import unquote
 from datetime import datetime
 
 # ═══════════════════════════════════════════════════════════════
@@ -94,7 +97,8 @@ ALLOWED_RULES = [
     # {"type": "suffix", "value": ".googleapis.com"},
 
     # ── IP-based rules ──
-    # {"type": "ip",        "value": "93.184.216.34"},
+    # example.com's IP — tests IP-based allowlisting
+    {"type": "ip", "value": "93.184.216.34"},
     # {"type": "ip_prefix", "value": "140.82."},
     # {"type": "cidr",      "value": "93.184.216.0/24"},
 
@@ -154,14 +158,35 @@ def _match_host_or_ip(host, ip_address, rule):
     if rtype in ("domain", "suffix"):
         return _match_domain(host, rule)
     elif rtype in ("ip", "ip_prefix", "cidr"):
-        return _match_ip(ip_address, rule)
+        # Check resolved IP first, then fall back to host if it looks like an IP
+        if _match_ip(ip_address, rule):
+            return True
+        # When host itself is an IP (e.g., curl http://93.184.216.34/),
+        # also check it against IP rules
+        if host and re.match(r'^\d{1,3}(\.\d{1,3}){3}$', host):
+            return _match_ip(host, rule)
     return False
+
+
+def _normalize_path(path):
+    """Normalize a URL path: decode percent-encoding, resolve ../ and ./."""
+    # Decode percent-encoded characters (e.g., %2e → .)
+    decoded = unquote(path)
+    # Normalize ../ and ./ using POSIX path rules
+    normalized = posixpath.normpath(decoded)
+    # normpath strips trailing slash and turns "" into ".", fix that
+    if not normalized.startswith("/"):
+        normalized = "/" + normalized
+    return normalized
 
 
 def _check_path(path, rule):
     """Check path restrictions. Returns (allowed, reason)."""
     if "paths" not in rule and "paths_blocked" not in rule:
         return True, "all paths"
+
+    # Normalize path before checking rules
+    path = _normalize_path(path)
 
     # Blocked paths take priority
     for pattern in rule.get("paths_blocked", []):
@@ -275,7 +300,51 @@ class TransparentEnforcer:
             else "unresolved"
         )
 
-        allowed, reason = _check_allowed(host, ip_address, port, path)
+        # In transparent/WireGuard mode, the Host header can be spoofed.
+        # Get the actual destination IP from the server connection (set from
+        # the original WireGuard packet, before Host header processing).
+        actual_dest_ip = None
+        if flow.server_conn and flow.server_conn.address:
+            actual_dest_ip = flow.server_conn.address[0]
+        # Use resolved IP if available, otherwise fall back to address
+        check_ip = ip_address if ip_address != "unresolved" else actual_dest_ip
+
+        # Check policy using the Host header (domain match)
+        allowed, reason = _check_allowed(host, check_ip, port, path)
+
+        # Anti-spoofing: if the Host header allowed the request, verify that
+        # the actual destination IP belongs to that hostname. Skip this check
+        # when the Host header IS an IP (no spoofing risk — IP is the dest).
+        if allowed and actual_dest_ip and not re.match(r'^\d{1,3}(\.\d{1,3}){3}$', host):
+            try:
+                resolved_ips = {
+                    addr[4][0]
+                    for addr in socket.getaddrinfo(host, None, socket.AF_INET)
+                }
+                if actual_dest_ip not in resolved_ips:
+                    ctx.log.warn(
+                        f"🚫 [{ts}] BLOCK  {scheme.upper()} {method} "
+                        f"{host}:{port}{path}  (Host header spoofed, "
+                        f"actual dest={actual_dest_ip} not in DNS for {host})"
+                    )
+                    flow.response = mitmproxy.http.Response.make(
+                        403,
+                        json.dumps({
+                            "error": "blocked_by_policy",
+                            "host": host,
+                            "actual_ip": actual_dest_ip,
+                            "port": port,
+                            "path": path,
+                            "scheme": scheme,
+                            "reason": f"Host header spoofing: {host} does not "
+                                      f"resolve to {actual_dest_ip}",
+                            "message": "Outbound request blocked by container firewall.",
+                        }, indent=2),
+                        {"Content-Type": "application/json"},
+                    )
+                    return
+            except socket.gaierror:
+                pass  # Can't resolve — let the normal policy check decide
 
         if allowed:
             ctx.log.info(
