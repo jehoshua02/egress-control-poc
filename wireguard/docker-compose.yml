@@ -1,0 +1,127 @@
+# =============================================================================
+# Container Firewall PoC — WireGuard Mode
+# =============================================================================
+# App has NO proxy awareness. Traffic routes through a WireGuard VPN tunnel
+# to mitmproxy which enforces egress policy.
+# =============================================================================
+
+networks:
+  internal_net:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+  external_net:
+    driver: bridge
+
+services:
+  proxy:
+    build: ./proxy
+    container_name: proxy
+    networks:
+      internal_net:
+        ipv4_address: 172.30.0.10
+      external_net: {}
+    ports:
+      - "8081:8081"
+    volumes:
+      - proxy-data:/root/.mitmproxy
+      - wg-config:/wg-config
+      - ./proxy/scripts:/home/mitmproxy/scripts:ro
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        exec mitmweb \
+            --mode wireguard@51820 \
+            --web-host 0.0.0.0 \
+            --web-port 8081 \
+            --set ssl_insecure=true \
+            --set block_global=false \
+            --set connection_strategy=lazy \
+            -s /home/mitmproxy/scripts/enforcer.py
+    restart: unless-stopped
+
+  config-init:
+    build: ./proxy
+    container_name: config-init
+    depends_on:
+      - proxy
+    volumes:
+      - proxy-data:/root/.mitmproxy:ro
+      - wg-config:/wg-config
+    entrypoint: python3
+    command: ["/home/mitmproxy/gen-client-conf.py"]
+    networks:
+      internal_net: {}
+
+  app:
+    build: ./app
+    container_name: app
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    networks:
+      internal_net:
+        ipv4_address: 172.30.0.20
+    depends_on:
+      config-init:
+        condition: service_completed_successfully
+    volumes:
+      - wg-config:/wg-config:ro
+      - proxy-data:/proxy-data:ro
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # ── Install mitmproxy CA cert for TLS interception ──
+        cp /proxy-data/mitmproxy-ca-cert.pem /usr/local/share/ca-certificates/mitmproxy.crt
+        update-ca-certificates
+
+        # ── Parse WireGuard client config ──
+        mkdir -p /etc/wireguard
+        cp /wg-config/wg0.conf /etc/wireguard/wg0.conf
+
+        PRIVKEY=$$(awk '/^PrivateKey/{print $$3}' /etc/wireguard/wg0.conf)
+        ADDRESS=$$(awk '/^Address/{print $$3}' /etc/wireguard/wg0.conf)
+        DNS=$$(awk '/^DNS/{print $$3}' /etc/wireguard/wg0.conf)
+        PUBKEY=$$(awk '/^PublicKey/{print $$3}' /etc/wireguard/wg0.conf)
+        ENDPOINT=$$(awk '/^Endpoint/{print $$3}' /etc/wireguard/wg0.conf)
+        ALLOWED=$$(awk '/^AllowedIPs/{print $$3}' /etc/wireguard/wg0.conf)
+
+        # ── Bring up WireGuard interface manually (skip sysctl) ──
+        ip link add wg0 type wireguard
+        wg set wg0 private-key <(echo "$$PRIVKEY") peer "$$PUBKEY" endpoint "$$ENDPOINT" allowed-ips "$$ALLOWED"
+        ip -4 address add "$$ADDRESS" dev wg0
+        ip link set mtu 1420 up dev wg0
+
+        # ── Policy routing (same as wg-quick) ──
+        wg set wg0 fwmark 51820
+        ip -4 route add 0.0.0.0/0 dev wg0 table 51820
+        ip -4 rule add not fwmark 51820 table 51820
+        ip -4 rule add table main suppress_prefixlength 0
+        # sysctl already set via docker-compose sysctls directive
+
+        # ── DNS ──
+        echo "nameserver $$DNS" > /etc/resolv.conf
+
+        # ── Block non-HTTP/HTTPS egress (prevent tunnel bypass) ──
+        iptables -A OUTPUT -o wg0 -p tcp --dport 80 -j ACCEPT
+        iptables -A OUTPUT -o wg0 -p tcp --dport 443 -j ACCEPT
+        iptables -A OUTPUT -o wg0 -p udp --dport 53 -j ACCEPT
+        iptables -A OUTPUT -o wg0 -p tcp --dport 53 -j ACCEPT
+        iptables -A OUTPUT -o wg0 -j DROP
+
+        echo "✅ WireGuard tunnel active"
+        ip route
+        ip route show table 51820
+        exec /bin/sh
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+volumes:
+  proxy-data:
+  wg-config:
